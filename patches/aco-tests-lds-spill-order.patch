@@ -1,0 +1,238 @@
+diff --git a/src/amd/compiler/tests/helpers.cpp b/src/amd/compiler/tests/helpers.cpp
+index 6fcd59e..66eebe8 100644
+--- a/src/amd/compiler/tests/helpers.cpp
++++ b/src/amd/compiler/tests/helpers.cpp
+@@ -358,6 +358,48 @@ finish_schedule_vopd_test()
+    aco_print_program(program.get(), output);
+ }
+ 
++void
++finish_spill_test()
++{
++   finish_program(program.get(), true, true);
++   if (!aco::validate_ir(program.get())) {
++      fail_test("Validation before spilling failed");
++      return;
++   }
++
++   program->workgroup_size = program->wave_size;
++   aco::live_var_analysis(program.get());
++   aco::spill(program.get());
++
++   if (!aco::validate_ir(program.get())) {
++      fail_test("Validation after spilling failed");
++      return;
++   }
++
++   aco_print_program(program.get(), output);
++}
++
++void
++finish_schedule_test()
++{
++   finish_program(program.get(), true, true);
++   if (!aco::validate_ir(program.get())) {
++      fail_test("Validation before scheduling failed");
++      return;
++   }
++
++   program->workgroup_size = program->wave_size;
++   aco::live_var_analysis(program.get());
++   aco::schedule_program(program.get());
++
++   if (!aco::validate_ir(program.get())) {
++      fail_test("Validation after scheduling failed");
++      return;
++   }
++
++   aco_print_program(program.get(), output);
++}
++
+ void
+ finish_waitcnt_test()
+ {
+diff --git a/src/amd/compiler/tests/helpers.h b/src/amd/compiler/tests/helpers.h
+index d20d3e2..6206c34 100644
+--- a/src/amd/compiler/tests/helpers.h
++++ b/src/amd/compiler/tests/helpers.h
+@@ -75,6 +75,8 @@ void finish_optimizer_postRA_test();
+ void finish_to_hw_instr_test();
+ void finish_lower_branches_test();
+ void finish_schedule_vopd_test();
++void finish_spill_test();
++void finish_schedule_test();
+ void finish_waitcnt_test();
+ void finish_insert_nops_test(bool endpgm = true);
+ void finish_form_hard_clause_test();
+diff --git a/src/amd/compiler/tests/meson.build b/src/amd/compiler/tests/meson.build
+index 7b2287d..f72643b 100644
+--- a/src/amd/compiler/tests/meson.build
++++ b/src/amd/compiler/tests/meson.build
+@@ -21,6 +21,7 @@ aco_tests_files = files(
+   'test_optimizer_postRA.cpp',
+   'test_scheduler.cpp',
+   'test_sdwa.cpp',
++  'test_spill.cpp',
+   'test_to_hw_instr.cpp',
+   'test_tests.cpp',
+ )
+diff --git a/src/amd/compiler/tests/test_scheduler.cpp b/src/amd/compiler/tests/test_scheduler.cpp
+index 244e3e7..d645a75 100644
+--- a/src/amd/compiler/tests/test_scheduler.cpp
++++ b/src/amd/compiler/tests/test_scheduler.cpp
+@@ -424,3 +424,93 @@ BEGIN_TEST(vopd_sched.dot2acc_from_vop2_inline)
+ 
+    finish_schedule_vopd_test();
+ END_TEST
++
++BEGIN_TEST(scheduler.lds_spill_order)
++   /* VGPR spills to LDS and their reloads, as aco_spill.cpp creates them, must stay in order
++    * against the other spills and reloads of their slot. With no memory_sync_info on them, load1's
++    * downward pass moved the reload of a and the spill of a below load1, while the spill of b
++    * stayed (load1's address is b's last use): the spill of a came after the spill of b, and the
++    * reload of b read a.
++    */
++   //>> v1: %base:v[0],  s4: %rsrc:s[0-3] = p_startpgm
++   if (!setup_cs("v1 s4", GFX10_3))
++      return;
++
++   memory_sync_info spill_sync(storage_shared, semantic_private);
++
++   bld.pseudo(aco_opcode::p_logical_start);
++   Temp m0_zero = bld.copy(bld.def(s1, m0), Operand::zero());
++   //>> v1: %a = v_xor_b32 1, %base
++   //>> v1: %b = v_xor_b32 2, %base
++   Temp a = bld.vop2(aco_opcode::v_xor_b32, bld.def(v1), Operand::c32(1), inputs[0]);
++   Temp b = bld.vop2(aco_opcode::v_xor_b32, bld.def(v1), Operand::c32(2), inputs[0]);
++   Temp c = bld.vop2(aco_opcode::v_xor_b32, bld.def(v1), Operand::c32(3), inputs[0]);
++
++   //>> s1: %m0_zero:m0 = p_parallelcopy 0
++   //>> ds_write_addtid_b32 %m0_zero:m0, %a storage:shared semantics:private
++   //>> v1: %reload_a = ds_read_addtid_b32 %m0_zero:m0 storage:shared semantics:private
++   //>> ds_write_addtid_b32 %m0_zero:m0, %b storage:shared semantics:private
++   //>> v1: %reload_b = ds_read_addtid_b32 %m0_zero:m0 storage:shared semantics:private
++   //>> v1: %sum = v_add_u32 %reload_a, %mul
++   //>> p_unit_test 2, %reload_b
++   bld.ds(aco_opcode::ds_write_addtid_b32, bld.m0(m0_zero), a, 0)->ds().sync = spill_sync;
++   Temp addr0 = bld.vop2(aco_opcode::v_lshlrev_b32, bld.def(v1), Operand::c32(2), inputs[0]);
++   Temp load0 = bld.mubuf(aco_opcode::buffer_load_dword, bld.def(v1), Operand(inputs[1]),
++                          Operand(addr0), Operand::zero(), 0, true);
++   Temp mul = bld.vop3(aco_opcode::v_mul_lo_u32, bld.def(v1), c, load0);
++   Builder::Result reload_a =
++      bld.ds(aco_opcode::ds_read_addtid_b32, bld.def(v1), bld.m0(m0_zero), 0);
++   reload_a->ds().sync = spill_sync;
++   Temp sum = bld.vop2(aco_opcode::v_add_u32, bld.def(v1), reload_a, mul);
++   bld.ds(aco_opcode::ds_write_addtid_b32, bld.m0(m0_zero), b, 0)->ds().sync = spill_sync;
++   Temp addr1 = bld.vop2(aco_opcode::v_add_u32, bld.def(v1), Operand::c32(0x120), b);
++   Temp load1 = bld.mubuf(aco_opcode::buffer_load_dword, bld.def(v1), Operand(inputs[1]),
++                          Operand(addr1), Operand::zero(), 0, true);
++   Builder::Result reload_b =
++      bld.ds(aco_opcode::ds_read_addtid_b32, bld.def(v1), bld.m0(m0_zero), 0);
++   reload_b->ds().sync = spill_sync;
++
++   bld.pseudo(aco_opcode::p_unit_test, Operand::zero(), sum);
++   bld.pseudo(aco_opcode::p_unit_test, Operand::c32(1), load1);
++   bld.pseudo(aco_opcode::p_unit_test, Operand::c32(2), reload_b);
++   bld.pseudo(aco_opcode::p_logical_end);
++
++   finish_schedule_test();
++END_TEST
++
++BEGIN_TEST(scheduler.lds_spill_order_up)
++   /* The same for a reload and its own spill. With no memory_sync_info on them, the load's upward
++    * pass moved the reload of v above the spill of v.
++    */
++   //>> v1: %base:v[0],  s4: %rsrc:s[0-3] = p_startpgm
++   if (!setup_cs("v1 s4", GFX10_3))
++      return;
++
++   memory_sync_info spill_sync(storage_shared, semantic_private);
++
++   bld.pseudo(aco_opcode::p_logical_start);
++   Temp m0_zero = bld.copy(bld.def(s1, m0), Operand::zero());
++   Temp addr = bld.vop2(aco_opcode::v_lshlrev_b32, bld.def(v1), Operand::c32(2), inputs[0]);
++
++   //>> v1: %v = buffer_load_dword %rsrc, %_, 0 offen
++   //>> ds_write_addtid_b32 %_:m0, %v storage:shared semantics:private
++   //>> v1: %reload_v = ds_read_addtid_b32 %_:m0 storage:shared semantics:private
++   //>> p_unit_test 0, %reload_v
++   Temp v = bld.mubuf(aco_opcode::buffer_load_dword, bld.def(v1), Operand(inputs[1]),
++                      Operand(addr), Operand::zero(), 0, true);
++   bld.ds(aco_opcode::ds_write_addtid_b32, bld.m0(m0_zero), v, 0)->ds().sync = spill_sync;
++   Temp x = bld.vop2(aco_opcode::v_xor_b32, bld.def(v1), Operand::c32(5), inputs[0]);
++   Builder::Result reload_v =
++      bld.ds(aco_opcode::ds_read_addtid_b32, bld.def(v1), bld.m0(m0_zero), 0);
++   reload_v->ds().sync = spill_sync;
++   Builder::Result reload_w =
++      bld.ds(aco_opcode::ds_read_addtid_b32, bld.def(v1), bld.m0(m0_zero), 256);
++   reload_w->ds().sync = spill_sync;
++
++   bld.pseudo(aco_opcode::p_unit_test, Operand::zero(), reload_v);
++   bld.pseudo(aco_opcode::p_unit_test, Operand::c32(1), x);
++   bld.pseudo(aco_opcode::p_unit_test, Operand::c32(2), reload_w);
++   bld.pseudo(aco_opcode::p_logical_end);
++
++   finish_schedule_test();
++END_TEST
+diff --git a/src/amd/compiler/tests/test_spill.cpp b/src/amd/compiler/tests/test_spill.cpp
+new file mode 100644
+index 0000000..b2abbc8
+--- /dev/null
++++ b/src/amd/compiler/tests/test_spill.cpp
+@@ -0,0 +1,56 @@
++/*
++ * Copyright 2026 The Mesa Authors
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "helpers.h"
++
++using namespace aco;
++
++BEGIN_TEST(spill.lds_sync)
++   /* A single-wave compute shader with LDS to spare spills VGPRs to LDS. The spills and reloads
++    * need a memory_sync_info the scheduler orders, or it can reorder a spill and a reload of the
++    * same slot (see scheduler.lds_spill_order and scheduler.lds_spill_order_up).
++    */
++   //>> v1: %base:v[0] = p_startpgm
++   if (!setup_cs("v1", GFX10_3))
++      return;
++
++   std::vector<Temp> vals;
++   for (unsigned i = 0; i < 260; i++)
++      vals.push_back(bld.vop2(aco_opcode::v_xor_b32, bld.def(v1), Operand::c32(i), inputs[0]));
++   for (unsigned i = 260; i-- > 0;)
++      bld.pseudo(aco_opcode::p_unit_test, Operand::c32(i), vals[i]);
++
++   //>> s1: %m0_zero:m0 = p_parallelcopy 0
++   //! ds_write_addtid_b32 %m0_zero:m0, (kill)%_ storage:shared semantics:private
++   //>> v1: %_ = ds_read_addtid_b32 %m0_zero:m0 offset0:# storage:shared semantics:private
++   finish_spill_test();
++END_TEST
++
++BEGIN_TEST(spill.lds_sync_multi_dword)
++   /* The same for a value of more than one dword, which is spilled and reloaded a dword at a
++    * time.
++    */
++   //>> v1: %base:v[0] = p_startpgm
++   if (!setup_cs("v1", GFX10_3))
++      return;
++
++   std::vector<Temp> vals;
++   for (unsigned i = 0; i < 130; i++) {
++      Temp lo = bld.vop2(aco_opcode::v_xor_b32, bld.def(v1), Operand::c32(i * 2), inputs[0]);
++      Temp hi = bld.vop2(aco_opcode::v_xor_b32, bld.def(v1), Operand::c32(i * 2 + 1), inputs[0]);
++      vals.push_back(bld.pseudo(aco_opcode::p_create_vector, bld.def(v2), lo, hi));
++   }
++   for (unsigned i = 130; i-- > 0;)
++      bld.pseudo(aco_opcode::p_unit_test, Operand::c32(i), vals[i]);
++
++   //>> s1: %m0_zero:m0 = p_parallelcopy 0
++   //! v1: %lo,  v1: %hi = p_split_vector (kill)%_
++   //! ds_write_addtid_b32 %m0_zero:m0, (kill)%lo storage:shared semantics:private
++   //! ds_write_addtid_b32 %m0_zero:m0, (kill)%hi offset0:256 storage:shared semantics:private
++   //>> v1: %rlo = ds_read_addtid_b32 %m0_zero:m0 offset0:# storage:shared semantics:private
++   //! v1: %rhi = ds_read_addtid_b32 %m0_zero:m0 offset0:# storage:shared semantics:private
++   //! v2: %_ = p_create_vector (kill)%rlo, (kill)%rhi
++   finish_spill_test();
++END_TEST
